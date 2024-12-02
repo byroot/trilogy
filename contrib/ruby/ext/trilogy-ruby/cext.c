@@ -85,6 +85,20 @@ static struct trilogy_ctx *get_open_ctx(VALUE obj)
     return ctx;
 }
 
+static void rb_trilogy_acquire_buffer(struct trilogy_ctx *ctx)
+{
+    if (!ctx->conn.packet_buffer.buff) {
+        trilogy_buffer_init(&ctx->conn.packet_buffer, TRILOGY_DEFAULT_BUF_SIZE);
+    }
+}
+
+static void rb_trilogy_release_buffer(struct trilogy_ctx *ctx)
+{
+    if (ctx->conn.packet_buffer.buff) {
+        trilogy_buffer_free(&ctx->conn.packet_buffer);
+    }
+}
+
 NORETURN(static void trilogy_syserr_fail_str(int, VALUE));
 static void trilogy_syserr_fail_str(int e, VALUE msg)
 {
@@ -115,6 +129,8 @@ static void handle_trilogy_error(struct trilogy_ctx *ctx, int rc, const char *ms
     va_start(args, msg);
     VALUE rbmsg = rb_vsprintf(msg, args);
     va_end(args);
+
+    rb_trilogy_release_buffer(ctx);
 
     if (!trilogy_error_recoverable_p(rc)) {
         if (ctx->conn.socket != NULL) {
@@ -178,7 +194,7 @@ static VALUE allocate_trilogy(VALUE klass)
 
     ctx->query_flags = TRILOGY_FLAGS_DEFAULT;
 
-    if (trilogy_init(&ctx->conn) < 0) {
+    if (trilogy_init_no_buffer(&ctx->conn) < 0) {
         VALUE rbmsg = rb_str_new("trilogy_init", 13);
         trilogy_syserr_fail_str(errno, rbmsg);
     }
@@ -602,6 +618,8 @@ static VALUE rb_trilogy_connect(VALUE self, VALUE encoding, VALUE charset, VALUE
         connopt.tls_max_version = NUM2INT(val);
     }
 
+    rb_trilogy_acquire_buffer(ctx);
+
     int rc = try_connect(ctx, &handshake, &connopt);
     if (rc != TRILOGY_OK) {
         if (connopt.path) {
@@ -617,6 +635,8 @@ static VALUE rb_trilogy_connect(VALUE self, VALUE encoding, VALUE charset, VALUE
 
     authenticate(ctx, &handshake, connopt.ssl_mode);
 
+    rb_trilogy_release_buffer(ctx);
+
     return Qnil;
 }
 
@@ -625,6 +645,8 @@ static VALUE rb_trilogy_change_db(VALUE self, VALUE database)
     struct trilogy_ctx *ctx = get_open_ctx(self);
 
     StringValue(database);
+
+    rb_trilogy_acquire_buffer(ctx);
 
     int rc = trilogy_change_db_send(&ctx->conn, RSTRING_PTR(database), RSTRING_LEN(database));
 
@@ -653,12 +675,16 @@ static VALUE rb_trilogy_change_db(VALUE self, VALUE database)
         }
     }
 
+    rb_trilogy_release_buffer(ctx);
+
     return Qtrue;
 }
 
 static VALUE rb_trilogy_set_server_option(VALUE self, VALUE option)
 {
     struct trilogy_ctx *ctx = get_open_ctx(self);
+
+    rb_trilogy_acquire_buffer(ctx);
 
     int rc = trilogy_set_option_send(&ctx->conn, NUM2INT(option));
 
@@ -686,6 +712,8 @@ static VALUE rb_trilogy_set_server_option(VALUE self, VALUE option)
             handle_trilogy_error(ctx, rc, "trilogy_set_option_recv");
         }
     }
+
+    rb_trilogy_release_buffer(ctx);
 
     return Qtrue;
 }
@@ -892,6 +920,10 @@ static VALUE execute_read_query_response(struct trilogy_ctx *ctx)
         handle_trilogy_error(ctx, args.rc, args.msg);
     }
 
+    if (!(ctx->conn.server_status & TRILOGY_SERVER_STATUS_MORE_RESULTS_EXISTS)) {
+        rb_trilogy_release_buffer(ctx);
+    }
+
     return result;
 }
 
@@ -924,6 +956,8 @@ static VALUE rb_trilogy_query(VALUE self, VALUE query)
     StringValue(query);
     query = rb_str_export_to_enc(query, rb_to_encoding(ctx->encoding));
 
+    rb_trilogy_acquire_buffer(ctx);
+
     int rc = trilogy_query_send(&ctx->conn, RSTRING_PTR(query), RSTRING_LEN(query));
 
     if (rc == TRILOGY_AGAIN) {
@@ -940,6 +974,8 @@ static VALUE rb_trilogy_query(VALUE self, VALUE query)
 static VALUE rb_trilogy_ping(VALUE self)
 {
     struct trilogy_ctx *ctx = get_open_ctx(self);
+
+    rb_trilogy_acquire_buffer(ctx);
 
     int rc = trilogy_ping_send(&ctx->conn);
 
@@ -968,6 +1004,7 @@ static VALUE rb_trilogy_ping(VALUE self)
         }
     }
 
+    rb_trilogy_release_buffer(ctx);
     return Qtrue;
 }
 
@@ -985,13 +1022,19 @@ static VALUE rb_trilogy_escape(VALUE self, VALUE str)
     const char *escaped_str;
     size_t escaped_len;
 
+    rb_trilogy_acquire_buffer(ctx);
+
     int rc = trilogy_escape(&ctx->conn, RSTRING_PTR(str), RSTRING_LEN(str), &escaped_str, &escaped_len);
 
     if (rc < 0) {
         handle_trilogy_error(ctx, rc, "trilogy_escape");
     }
 
-    return rb_enc_str_new(escaped_str, escaped_len, str_enc);
+    VALUE escaped_string = rb_enc_str_new(escaped_str, escaped_len, str_enc);
+
+    rb_trilogy_release_buffer(ctx);
+
+    return escaped_string;
 }
 
 static VALUE rb_trilogy_close(VALUE self)
@@ -1001,6 +1044,8 @@ static VALUE rb_trilogy_close(VALUE self)
     if (ctx->conn.socket == NULL) {
         return Qnil;
     }
+
+    rb_trilogy_acquire_buffer(ctx);
 
     int rc = trilogy_close_send(&ctx->conn);
 
@@ -1026,6 +1071,8 @@ static VALUE rb_trilogy_close(VALUE self)
     // We aren't checking or raising errors here (we need close to always close the socket and free the connection), so
     // we must clear any SSL errors left in the queue from a read/write.
     ERR_clear_error();
+
+    rb_trilogy_release_buffer(ctx);
 
     trilogy_free(&ctx->conn);
 
